@@ -39,6 +39,21 @@ cargo run -- --addr 127.0.0.1:8787      # or set WARP_SERVER_ADDR
 # RUST_LOG=warp_server=debug for verbose logs
 ```
 
+### Quickstart
+
+`quickstart.sh` builds and launches the relay (and optionally the client,
+wired up correctly):
+
+```bash
+./quickstart.sh                      # build + run the relay (foreground)
+./quickstart.sh --client             # relay + launch a sharer client (built with
+                                     #   creating_shared_sessions so /remote-control shows)
+./quickstart.sh --join <SESSION_ID>  # relay + launch a viewer via the warposs:// deeplink
+```
+
+It expects a `warpdotdev/warp` checkout at `../warp` (override with `--warp <path>`)
+for the `--client`/`--join` modes. `--help` lists all options.
+
 ## Point the Warp client at it
 
 By default the open-source `warp-oss` build ignores server-URL overrides
