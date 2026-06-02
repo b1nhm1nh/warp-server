@@ -1,0 +1,69 @@
+diff --git a/crates/warp_core/src/channel/mod.rs b/crates/warp_core/src/channel/mod.rs
+index b72cc1e7..b770147a 100644
+--- a/crates/warp_core/src/channel/mod.rs
++++ b/crates/warp_core/src/channel/mod.rs
+@@ -1,6 +1,10 @@
+ mod config;
+ mod state;
+ 
++#[cfg(test)]
++#[path = "mod_test.rs"]
++mod tests;
++
+ use std::fmt;
+ 
+ pub use config::*;
+@@ -37,13 +41,15 @@ impl Channel {
+     /// Whether this channel honors the `--server-root-url` / `--ws-server-url` /
+     /// `--session-sharing-server-url` flags (and their `WARP_*` env-var equivalents).
+     ///
+-    /// Release channels (`Stable`, `Preview`, `Oss`) ignore these overrides so shipped
++    /// Release channels (`Stable`, `Preview`) ignore these overrides so shipped
+     /// builds can't be redirected away from their baked-in server URLs. Internal-only channels
+-    /// (`Dev`, `Local`, `Integration`) continue to honor them for local development and testing.
++    /// (`Dev`, `Local`, `Integration`) and the open-source `Oss` build honor them: `Oss` is a
++    /// self-built binary, so allowing overrides lets users point it at a self-hosted server
++    /// (e.g. a local session-sharing relay) for local development and testing.
+     pub fn allows_server_url_overrides(&self) -> bool {
+         match self {
+-            Channel::Dev | Channel::Local | Channel::Integration => true,
+-            Channel::Stable | Channel::Preview | Channel::Oss => false,
++            Channel::Dev | Channel::Local | Channel::Integration | Channel::Oss => true,
++            Channel::Stable | Channel::Preview => false,
+         }
+     }
+ 
+diff --git a/crates/warp_core/src/channel/mod_test.rs b/crates/warp_core/src/channel/mod_test.rs
+new file mode 100644
+index 00000000..785f46e5
+--- /dev/null
++++ b/crates/warp_core/src/channel/mod_test.rs
+@@ -0,0 +1,28 @@
++use super::Channel;
++
++/// `Oss` must honor server-URL overrides so a self-built OSS binary can be
++/// pointed at a self-hosted server (e.g. a local session-sharing relay) via
++/// `WARP_SESSION_SHARING_SERVER_URL`. `Stable`/`Preview` must not.
++#[test]
++fn server_url_override_allowed_per_channel() {
++    let allowed = [
++        Channel::Dev,
++        Channel::Local,
++        Channel::Integration,
++        Channel::Oss,
++    ];
++    let denied = [Channel::Stable, Channel::Preview];
++
++    for c in allowed {
++        assert!(
++            c.allows_server_url_overrides(),
++            "{c:?} should allow server-url overrides"
++        );
++    }
++    for c in denied {
++        assert!(
++            !c.allows_server_url_overrides(),
++            "{c:?} should deny server-url overrides"
++        );
++    }
++}

@@ -1,0 +1,31 @@
+[package]
+name = "warp-server"
+version = "0.1.0"
+edition = "2024"
+authors = ["self-hosted"]
+description = "Self-hosted, limit-free relay for Warp session sharing (remote control)."
+publish = false
+
+[[bin]]
+name = "warp-server"
+path = "src/main.rs"
+
+[dependencies]
+# The wire protocol — pinned to the exact rev the Warp client builds against
+# (see warp/Cargo.toml). This guarantees serde-compatible message shapes.
+session-sharing-protocol = { git = "https://github.com/warpdotdev/session-sharing-protocol.git", rev = "9e437df5be3c318999a9c94dba1826ebb33ad679" }
+
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "signal"] }
+axum = { version = "0.7", features = ["ws"] }
+futures-util = "0.3"
+dashmap = "6"
+uuid = { version = "1", features = ["v4"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+
+[dev-dependencies]
+tokio-tungstenite = "0.24"
+tungstenite = "0.24"
