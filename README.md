@@ -83,14 +83,21 @@ two simultaneous sessions with no cross-talk.
 
 ### Live multi-session demo
 
-Drive a running server with N concurrent sessions (each: 1 sharer + 2 viewers +
-a remote command), to see multi-session + remote control end to end:
+Drive a running server with `N` concurrent sessions — each opens 1 sharer + 2
+viewers, streams live output, and issues a remote command — to see multi-session
+and remote control end to end:
 
 ```bash
-cargo run -- --addr 127.0.0.1:8787 &                       # start the server
+# 1. start the server
+cargo run -- --addr 127.0.0.1:8787 &
+
+# 2. run the demo against it: <ws-url> <num-sessions>
 cargo run --example multi_session_demo -- ws://127.0.0.1:8787 25
 # => "25/25 sessions succeeded (no quota / limit errors)"
 ```
+
+`N` defaults to 3 if omitted. Verified up to 25 concurrent sessions (75 live
+connections) with no quota/limit errors.
 
 ## Syncing with upstream
 
