@@ -32,6 +32,12 @@ impl Drop for TestServer {
 
 impl TestServer {
     pub async fn start() -> Self {
+        Self::start_with_args(&[]).await
+    }
+
+    /// Like [`TestServer::start`] but appends `extra` CLI args (e.g.
+    /// `&["--session-grace-secs", "1"]`) to the spawned binary.
+    pub async fn start_with_args(extra: &[&str]) -> Self {
         // Grab a free port by binding to :0 then releasing it.
         let port = {
             let l = StdTcpListener::bind("127.0.0.1:0").unwrap();
@@ -40,6 +46,7 @@ impl TestServer {
         let child = Command::new(env!("CARGO_BIN_EXE_warp-server"))
             .arg("--addr")
             .arg(format!("127.0.0.1:{port}"))
+            .args(extra)
             .env("RUST_LOG", "warn")
             .spawn()
             .expect("spawn warp-server");
@@ -120,6 +127,8 @@ where
 }
 
 /// Assert that NO viewer message matching `pred` arrives within `ms`.
+// Shared harness helper: not every test binary uses every helper.
+#[allow(dead_code)]
 pub async fn assert_no_viewer<F>(ws: &mut Ws, ms: u64, pred: F)
 where
     F: Fn(&viewer::DownstreamMessage) -> bool,
@@ -176,6 +185,20 @@ pub fn viewer_init(
         last_received_event_no,
         latest_block_id: None,
         telemetry_context: None,
+        feature_support: Default::default(),
+    })
+}
+
+// Shared harness helper: not every test binary uses every helper.
+#[allow(dead_code)]
+pub fn reconnect_msg(token: sharer::ReconnectToken) -> sharer::UpstreamMessage {
+    use session_sharing_protocol::common::SessionSecret;
+    sharer::UpstreamMessage::Reconnect(sharer::ReconnectPayload {
+        session_secret: SessionSecret::default(),
+        reconnect_token: token,
+        user_id: UserID::default(),
+        latest_block_id: BlockId::default(),
+        selection: Selection::default(),
         feature_support: Default::default(),
     })
 }

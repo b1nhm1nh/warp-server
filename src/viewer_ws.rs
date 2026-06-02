@@ -17,7 +17,7 @@ use session_sharing_protocol::sharer;
 use session_sharing_protocol::viewer::{DownstreamMessage, FailedToJoinReason, UpstreamMessage};
 use tokio::sync::{Mutex, mpsc};
 
-use crate::session::Session;
+use crate::session::{Session, WRITER_CHANNEL_CAP};
 use crate::state::ServerState;
 
 pub async fn join(
@@ -25,13 +25,14 @@ pub async fn join(
     Path(session_id): Path<SessionId>,
     ws: WebSocketUpgrade,
 ) -> Response {
+    let ws = ws.max_message_size(state.config.max_message_bytes);
     ws.on_upgrade(move |socket| handle_join(state, session_id, socket))
 }
 
 fn spawn_writer(
     mut sink: futures_util::stream::SplitSink<WebSocket, Message>,
-) -> mpsc::UnboundedSender<DownstreamMessage> {
-    let (tx, mut rx) = mpsc::unbounded_channel::<DownstreamMessage>();
+) -> mpsc::Sender<DownstreamMessage> {
+    let (tx, mut rx) = mpsc::channel::<DownstreamMessage>(WRITER_CHANNEL_CAP);
     tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
             match msg.to_json() {
@@ -70,9 +71,11 @@ async fn handle_join(state: Arc<ServerState>, session_id: SessionId, socket: Web
     };
 
     let Some(session) = state.get(&session_id) else {
-        let _ = viewer_tx.send(DownstreamMessage::FailedToJoin {
-            reason: FailedToJoinReason::SessionNotFound,
-        });
+        let _ = viewer_tx
+            .send(DownstreamMessage::FailedToJoin {
+                reason: FailedToJoinReason::SessionNotFound,
+            })
+            .await;
         return;
     };
 
@@ -85,12 +88,14 @@ async fn handle_join(state: Arc<ServerState>, session_id: SessionId, socket: Web
 
         if is_reconnect {
             // Catch the viewer up on anything missed, then confirm rejoin.
+            // Use try_send (non-blocking) so we never hold the session lock
+            // awaiting a slow socket; the channel has WRITER_CHANNEL_CAP slots.
             for event in s.events_after(init.last_received_event_no) {
-                let _ = viewer_tx.send(DownstreamMessage::OrderedTerminalEvent(event));
+                let _ = viewer_tx.try_send(DownstreamMessage::OrderedTerminalEvent(event));
             }
             s.viewers.insert(viewer_id.clone(), viewer_tx.clone());
             let participant_list = Box::new(s.participants.clone());
-            let _ = viewer_tx.send(DownstreamMessage::RejoinedSuccessfully { participant_list });
+            let _ = viewer_tx.try_send(DownstreamMessage::RejoinedSuccessfully { participant_list });
         } else {
             let replica = s.input_replica_id.clone();
             s.add_present_viewer(viewer_id.clone(), replica);
@@ -112,7 +117,7 @@ async fn handle_join(state: Arc<ServerState>, session_id: SessionId, socket: Web
                 detailed_source_type: s.source_type.clone(),
                 source_task_id: s.source_task_id.clone(),
             };
-            let _ = viewer_tx.send(joined);
+            let _ = viewer_tx.try_send(joined);
 
             // Notify the sharer + other viewers that the roster changed.
             let list = s.participants.clone();
@@ -151,7 +156,7 @@ async fn run_viewer_loop(
             UpstreamMessage::Initialize(_) => {}
             UpstreamMessage::Ping { data } => {
                 if let Some(tx) = s.viewers.get(&viewer_id) {
-                    let _ = tx.send(DownstreamMessage::Pong { data });
+                    let _ = tx.try_send(DownstreamMessage::Pong { data });
                 }
             }
             // --- Control path: forward viewer request to the sharer ---
@@ -193,8 +198,9 @@ async fn run_viewer_loop(
                 // Optimistically applied on the viewer; echo to sharer + others.
                 s.send_sharer(sharer::DownstreamMessage::InputUpdated(update.clone()));
                 let me = viewer_id.clone();
-                s.viewers
-                    .retain(|id, tx| id == &me || tx.send(DownstreamMessage::InputUpdated(update.clone())).is_ok());
+                s.viewers.retain(|id, tx| {
+                    id == &me || tx.try_send(DownstreamMessage::InputUpdated(update.clone())).is_ok()
+                });
             }
             UpstreamMessage::UpdateSelection(update) => {
                 let presence = DownstreamMessage::ParticipantPresenceUpdated(
@@ -205,12 +211,12 @@ async fn run_viewer_loop(
                 );
                 let me = viewer_id.clone();
                 s.viewers
-                    .retain(|id, tx| id == &me || tx.send(presence.clone()).is_ok());
+                    .retain(|id, tx| id == &me || tx.try_send(presence.clone()).is_ok());
             }
             UpstreamMessage::RequestRole(role) => {
                 // No limits: auto-approve any role request immediately.
                 if let Some(tx) = s.viewers.get(&viewer_id) {
-                    let _ = tx.send(DownstreamMessage::RoleRequestResponse(
+                    let _ = tx.try_send(DownstreamMessage::RoleRequestResponse(
                         session_sharing_protocol::common::RoleRequestResponse::Approved {
                             new_role: role,
                         },

@@ -16,13 +16,11 @@ use session_sharing_protocol::sharer::{
 };
 use tokio::sync::{Mutex, mpsc};
 
-use crate::session::Session;
+use crate::session::{Session, WRITER_CHANNEL_CAP};
 use crate::state::ServerState;
 
-pub async fn create(
-    State(state): State<Arc<ServerState>>,
-    ws: WebSocketUpgrade,
-) -> Response {
+pub async fn create(State(state): State<Arc<ServerState>>, ws: WebSocketUpgrade) -> Response {
+    let ws = ws.max_message_size(state.config.max_message_bytes);
     ws.on_upgrade(move |socket| handle_create(state, socket))
 }
 
@@ -31,15 +29,17 @@ pub async fn resume(
     Path(session_id): Path<SessionId>,
     ws: WebSocketUpgrade,
 ) -> Response {
+    let ws = ws.max_message_size(state.config.max_message_bytes);
     ws.on_upgrade(move |socket| handle_resume(state, session_id, socket))
 }
 
-/// Split the socket into a writer task fed by an mpsc, plus the reader half.
-/// Returns the sender used to enqueue downstream messages to this sharer.
+/// Split the socket into a writer task fed by a *bounded* mpsc, plus the reader
+/// half. Returns the sender used to enqueue downstream messages to this sharer.
+/// A bounded queue means a stalled sharer socket can't grow memory without limit.
 fn spawn_writer(
     mut sink: futures_util::stream::SplitSink<WebSocket, Message>,
-) -> mpsc::UnboundedSender<DownstreamMessage> {
-    let (tx, mut rx) = mpsc::unbounded_channel::<DownstreamMessage>();
+) -> mpsc::Sender<DownstreamMessage> {
+    let (tx, mut rx) = mpsc::channel::<DownstreamMessage>(WRITER_CHANNEL_CAP);
     tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
             match msg.to_json() {
@@ -93,18 +93,21 @@ async fn handle_create(state: Arc<ServerState>, socket: WebSocket) {
 
     let sharer_tx = spawn_writer(sink);
     session.sharer_tx = Some(sharer_tx.clone());
+    session.sharer_epoch += 1;
     let reconnect_token = session.reconnect_token.clone();
     let sharer_firebase_uid = session.sharer_firebase_uid.clone();
 
     // Acknowledge creation. SessionSecret is unused by our (no-auth) server but
     // the client stores it; send a fresh one.
-    let _ = sharer_tx.send(DownstreamMessage::SessionInitialized {
-        session_id,
-        session_secret: SessionSecret::new(),
-        reconnect_token,
-        sharer_id: sharer_id.clone(),
-        sharer_firebase_uid,
-    });
+    let _ = sharer_tx
+        .send(DownstreamMessage::SessionInitialized {
+            session_id,
+            session_secret: SessionSecret::new(),
+            reconnect_token,
+            sharer_id: sharer_id.clone(),
+            sharer_firebase_uid,
+        })
+        .await;
 
     let session = Arc::new(Mutex::new(session));
     state.insert(session_id, session.clone());
@@ -121,7 +124,7 @@ async fn handle_resume(
     let (sink, mut stream) = socket.split();
 
     // First message must be Reconnect.
-    let _reconnect = loop {
+    let reconnect = loop {
         match stream.next().await {
             Some(Ok(Message::Text(t))) => match UpstreamMessage::from_json(&t) {
                 Ok(UpstreamMessage::Reconnect(p)) => break p,
@@ -140,16 +143,35 @@ async fn handle_resume(
     let Some(session) = state.get(&session_id) else {
         // Session is gone; tell the sharer and close.
         let tx = spawn_writer(sink);
-        let _ = tx.send(DownstreamMessage::FailedToReconnect {
-            reason: ReconnectionFailedReason::SessionNotFound,
-        });
+        let _ = tx
+            .send(DownstreamMessage::FailedToReconnect {
+                reason: ReconnectionFailedReason::SessionNotFound,
+            })
+            .await;
         return;
     };
 
     let sharer_tx = spawn_writer(sink);
     let (sharer_id, last_event_no, participant_list) = {
         let mut s = session.lock().await;
+
+        // SECURITY (#1): only the holder of the reconnect token issued at
+        // creation may take over the sharer role. Without this check, anyone
+        // who knows the session_id could hijack the sharer side and feed
+        // forged terminal output to viewers / intercept their control requests.
+        if reconnect.reconnect_token != s.reconnect_token {
+            tracing::warn!(%session_id, "resume rejected: wrong reconnect token");
+            drop(s);
+            let _ = sharer_tx
+                .send(DownstreamMessage::FailedToReconnect {
+                    reason: ReconnectionFailedReason::WrongReconnectionToken,
+                })
+                .await;
+            return;
+        }
+
         s.sharer_tx = Some(sharer_tx.clone());
+        s.sharer_epoch += 1;
         (
             s.sharer_id.clone(),
             s.latest_event_no,
@@ -157,10 +179,12 @@ async fn handle_resume(
         )
     };
 
-    let _ = sharer_tx.send(DownstreamMessage::SessionReconnected {
-        last_received_event_no: last_event_no,
-        participant_list,
-    });
+    let _ = sharer_tx
+        .send(DownstreamMessage::SessionReconnected {
+            last_received_event_no: last_event_no,
+            participant_list,
+        })
+        .await;
     tracing::info!(%session_id, "sharer resumed");
 
     run_sharer_loop(state, session, session_id, sharer_id, stream).await;
@@ -273,16 +297,34 @@ async fn run_sharer_loop(
         }
     }
 
-    // Sharer disconnected. Keep the session alive briefly for resume? For an
-    // in-memory relay we simply mark the sharer as gone; viewers stay until the
-    // session is reaped on explicit end. We clear the sharer_tx so stale sends
-    // don't go to a dead socket.
-    {
+    // Sharer disconnected (socket dropped without EndSession). Mark the sharer
+    // gone and snapshot the epoch, then spawn a reaper: after the grace period,
+    // if no `/resume` has bumped the epoch, the session is dead — notify any
+    // viewers and remove it. This prevents permanently-leaked sessions (#3).
+    let reap_epoch = {
         let mut s = session.lock().await;
         s.sharer_tx = None;
-    }
+        s.sharer_epoch
+    };
     let _ = sharer_id;
-    tracing::info!(%session_id, "sharer disconnected (session retained for resume)");
+    tracing::info!(%session_id, "sharer disconnected (grace period started)");
+
+    let grace = state.config.sharer_grace;
+    tokio::spawn(async move {
+        tokio::time::sleep(grace).await;
+        let mut s = session.lock().await;
+        // A resume (or a brand-new create reusing the Arc — impossible here)
+        // would have bumped the epoch. Unchanged => still orphaned.
+        if s.sharer_epoch != reap_epoch || s.sharer_tx.is_some() {
+            return;
+        }
+        s.broadcast_viewers(session_sharing_protocol::viewer::DownstreamMessage::SessionEnded {
+            reason: session_sharing_protocol::viewer::SessionEndedReason::EndedBySharer,
+        });
+        drop(s);
+        state.remove(&session_id);
+        tracing::info!(%session_id, "session reaped after sharer grace period");
+    });
 }
 
 fn presence_update_for(

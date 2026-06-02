@@ -5,11 +5,14 @@
 //! flow viewer → sharer. We keep an ordered event log so late joiners and
 //! reconnecting viewers can catch up.
 //!
-//! Delivery is lossless and ordered: each connection has an unbounded mpsc
-//! channel to its writer task. We never use a lossy broadcast for terminal
-//! bytes — dropping a `PtyBytesRead` would corrupt the viewer's screen.
+//! Delivery is ordered, and lossless up to a bound: each connection has a
+//! *bounded* mpsc channel to its writer task. We never use a lossy broadcast for
+//! terminal bytes — dropping a `PtyBytesRead` mid-stream would corrupt the
+//! viewer's screen. Instead, if a peer's queue fills (a stalled/slow socket),
+//! we drop that peer entirely; it can reconnect and catch up from the event log.
+//! This bounds per-connection memory regardless of peer behavior.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use session_sharing_protocol::common::{
     ActivePrompt, BlockId, InputReplicaId, OrderedTerminalEvent, ParticipantId, ParticipantInfo,
@@ -20,9 +23,20 @@ use session_sharing_protocol::{sharer, viewer};
 use tokio::sync::mpsc;
 
 /// A message queued for delivery to the sharer's websocket writer.
-pub type SharerTx = mpsc::UnboundedSender<sharer::DownstreamMessage>;
+pub type SharerTx = mpsc::Sender<sharer::DownstreamMessage>;
 /// A message queued for delivery to a viewer's websocket writer.
-pub type ViewerTx = mpsc::UnboundedSender<viewer::DownstreamMessage>;
+pub type ViewerTx = mpsc::Sender<viewer::DownstreamMessage>;
+
+/// Per-connection writer queue depth. A peer whose socket stalls long enough to
+/// fill this is dropped (and may reconnect). Bounds per-connection memory.
+pub const WRITER_CHANNEL_CAP: usize = 2048;
+
+/// Max terminal events retained for catch-up. Oldest are dropped past this, so
+/// a session's event log uses O(MAX_EVENT_LOG) memory no matter how long it
+/// runs. A reconnecting viewer that is further behind than this window will
+/// miss the trimmed events (acceptable for a relay; the screen self-heals on
+/// subsequent output).
+pub const MAX_EVENT_LOG: usize = 16_384;
 
 pub struct Session {
     /// Retained for logging/debugging; the registry key is the source of truth.
@@ -36,12 +50,19 @@ pub struct Session {
     /// `None` while the sharer is disconnected (awaiting `/resume`).
     pub sharer_tx: Option<SharerTx>,
 
+    /// Bumped every time a sharer connects or resumes. The disconnect reaper
+    /// captures the epoch at disconnect time and only reaps if it is unchanged
+    /// after the grace period — so a successful `/resume` cancels the reap
+    /// without any shared timer state.
+    pub sharer_epoch: u64,
+
     /// Connected viewers: id → writer channel.
     pub viewers: HashMap<ParticipantId, ViewerTx>,
 
-    /// Ordered terminal event log. Index is NOT event_no; we store events as
-    /// received and rely on `event_no` inside each for client-side ordering.
-    pub events: Vec<OrderedTerminalEvent>,
+    /// Ordered terminal event log (ring buffer, capped at `MAX_EVENT_LOG`).
+    /// Index is NOT event_no; we store events as received and rely on `event_no`
+    /// inside each for client-side ordering and catch-up.
+    pub events: VecDeque<OrderedTerminalEvent>,
     /// Highest event_no we have stored (for acks + catch-up). `None` if empty.
     pub latest_event_no: Option<usize>,
 
@@ -86,8 +107,9 @@ impl Session {
             sharer_id,
             sharer_firebase_uid,
             sharer_tx: None,
+            sharer_epoch: 0,
             viewers: HashMap::new(),
-            events: Vec::new(),
+            events: VecDeque::new(),
             latest_event_no: None,
             scrollback: init.scrollback,
             active_prompt: init.active_prompt,
@@ -101,23 +123,38 @@ impl Session {
     }
 
     /// Append a terminal event and fan it out to all connected viewers.
+    /// The log is a ring buffer capped at `MAX_EVENT_LOG`.
     pub fn record_and_broadcast_event(&mut self, event: OrderedTerminalEvent) {
         self.latest_event_no = Some(event.event_no);
-        // Keep a copy for catch-up, forward the original.
-        self.events.push(event.clone());
+        self.events.push_back(event.clone());
+        while self.events.len() > MAX_EVENT_LOG {
+            self.events.pop_front();
+        }
         self.broadcast_viewers(viewer::DownstreamMessage::OrderedTerminalEvent(event));
     }
 
-    /// Send a message to every connected viewer, dropping any whose channel
-    /// has closed (writer task gone).
+    /// Send a message to every connected viewer. A viewer whose writer queue is
+    /// closed (task gone) or full (socket stalled) is dropped — we never block
+    /// the session lock on a slow peer. Dropped viewers can reconnect and catch
+    /// up from the event log.
     pub fn broadcast_viewers(&mut self, msg: viewer::DownstreamMessage) {
-        self.viewers.retain(|_, tx| tx.send(msg.clone()).is_ok());
+        use mpsc::error::TrySendError;
+        self.viewers.retain(|id, tx| match tx.try_send(msg.clone()) {
+            Ok(()) => true,
+            Err(TrySendError::Full(_)) => {
+                tracing::warn!(viewer = %id, "viewer writer queue full; dropping slow viewer");
+                false
+            }
+            Err(TrySendError::Closed(_)) => false,
+        });
     }
 
-    /// Send a message to the sharer if connected.
+    /// Send a message to the sharer if connected. Non-blocking; a full/closed
+    /// sharer queue is dropped silently (the sharer loop will observe the
+    /// disconnect and the reaper will handle cleanup).
     pub fn send_sharer(&self, msg: sharer::DownstreamMessage) {
         if let Some(tx) = &self.sharer_tx {
-            let _ = tx.send(msg);
+            let _ = tx.try_send(msg);
         }
     }
 
@@ -150,7 +187,7 @@ impl Session {
     /// Events with `event_no` strictly greater than `after` (catch-up on join).
     pub fn events_after(&self, after: Option<usize>) -> Vec<OrderedTerminalEvent> {
         match after {
-            None => self.events.clone(),
+            None => self.events.iter().cloned().collect(),
             Some(n) => self
                 .events
                 .iter()

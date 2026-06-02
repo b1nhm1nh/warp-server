@@ -107,12 +107,44 @@ newer `warpdotdev/warp`:
 A repeatable checklist and an agent skill for this live under [`docs/`](docs/)
 and `.claude/skills/` (`sync-upstream`).
 
-## Notes / limitations
+## Security model
 
+This relay is **unauthenticated by design** — there are no user accounts and no
+quotas. Understand the trust model before exposing it:
+
+- **A session's UUID is its only secret, and it grants full control.** Anyone who
+  can reach the port *and* knows a live `session_id` can join that session and
+  **remote-control the sharer's terminal** (run commands, write to the PTY). The
+  Warp client connects to `/sessions/join/{id}` with **no password**, so the
+  server cannot require one without breaking the real client — the 122-bit random
+  UUIDv4 *is* the bearer token. Treat session links like secrets.
+- **Keep the default loopback bind.** `--addr` defaults to `127.0.0.1:8787`. Only
+  bind `0.0.0.0`/a LAN address if you trust everyone who can reach it.
+- **No TLS in-process.** Traffic (including the session UUID, secret, and every
+  keystroke) is plaintext `ws://`. For any non-loopback exposure, terminate TLS
+  in a reverse proxy (caddy/nginx) and front the relay with `wss://`.
 - Identity is placeholder (real Warp backend tokens are ignored) — avatars and
   display names are generic; view + control work regardless.
+
+### Hardening that *is* enforced
+
+- **Sharer resume requires the reconnect token.** `/sessions/{id}/resume` only
+  hands over the sharer role to a client presenting the `reconnect_token` issued
+  at creation — you can't hijack a session's sharer side by knowing just the id.
+- **Sessions are reaped.** If a sharer's socket drops without `EndSession`, the
+  session is held for `--session-grace-secs` (default 120) to allow a resume,
+  then removed (viewers notified). No permanently-leaked sessions.
+- **Bounded memory.** The terminal event log is a ring buffer
+  (`MAX_EVENT_LOG`); per-connection writer queues are bounded
+  (`WRITER_CHANNEL_CAP`) and a stalled peer is dropped (it can reconnect and
+  catch up); inbound WS messages are capped at `--max-message-bytes` (16 MiB).
+
+## Notes / limitations
+
 - Opaque payloads (`AgentResponseEvent`, CRDT input ops) are relayed as bytes,
   never interpreted.
+- A reconnecting viewer that fell further behind than `MAX_EVENT_LOG` events
+  misses the trimmed ones; the screen self-heals on subsequent output.
 - Not built for HA: one process, in-memory. For multi-machine scale you'd add a
   shared pub/sub layer (out of scope by design — latency-first).
 
