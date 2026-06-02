@@ -69,6 +69,65 @@ to view/control. Share as many sessions as you like — no quota error.
 > The patch is intentionally tiny and isolated to one file so it keeps applying
 > cleanly as upstream moves. See [Syncing with upstream](#syncing-with-upstream).
 
+## Remote control: gotchas
+
+Hard-won notes from driving the real GUI client against this relay. Most "it
+doesn't work" cases are one of these, not a relay bug.
+
+### `/remote-control` doesn't appear
+
+It's gated behind **two** cargo features (both must be enabled), and it lives in
+the **AI/agent input box**, not the shell prompt:
+
+- `hoa_remote_control` (on by default) **and** `creating_shared_sessions`
+  (**not** in the default set). Build with both:
+  ```bash
+  cargo build --release -p warp --bin warp-oss --features gui,creating_shared_sessions
+  ```
+- Typing `/remote-control` at the **zsh prompt** just yields
+  `zsh: no such file or directory` — it's a Warp slash command, enter it in the
+  agent input, not the terminal.
+
+### Joining: use the deeplink, NOT the `app.warp.dev` link
+
+The share UI shows `https://app.warp.dev/session/<id>`. That is Warp's **hosted
+web viewer** and talks to Warp's cloud — it will **not** reach your relay (the
+session exists only on your server, and the web app can't be repointed by an env
+var). To join *your* relay, launch a second client with the **native deeplink**
+and the same override:
+
+```bash
+WARP_SESSION_SHARING_SERVER_URL=ws://127.0.0.1:8787 \
+  ./target/release/warp-oss "warposs://shared_session/<SESSION_ID>"
+```
+
+- Scheme is `warposs` (the OSS channel's URL scheme); the client rejects any
+  other scheme for security, so an `https://…` arg is silently ignored.
+- Translate mechanically: `app.warp.dev/session/<id>` → `warposs://shared_session/<id>`.
+- Get `<SESSION_ID>` from the share link or the server's `session created` log.
+
+### Autosuggestions look missing
+
+Viewer inline suggestions come from a **local** history model that fills up only
+as commands *complete during the shared session* — it is not seeded from the
+sharer's existing shell history. A fresh viewer shows no suggestion until some
+commands have run in-session. Rich AI autosuggestions need Warp's authenticated
+prediction backend, which a relay-only/logged-out setup bypasses. Neither is a
+relay defect.
+
+### Interactive TUIs feel laggy
+
+Block commands (`ls`, `git status`) are snappy. Typing into a full-screen
+program (`vim`, `claude`, `top`) is keystroke → relay → sharer → PTY → back per
+character, so it feels laggy — inherent to remote control, not the server (which
+sits near 0% CPU). Judge responsiveness with block commands. Also: each GUI
+instance is ~500 MB, so don't leave stale sharer/viewer windows running.
+
+### Restart drops sessions
+
+State is in-memory. Restarting `warp-server` invalidates all live session IDs;
+clients must re-share. The old `session created` IDs won't be joinable.
+
 ## Test
 
 ```bash
