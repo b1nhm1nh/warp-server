@@ -119,6 +119,16 @@ async fn handle_join(state: Arc<ServerState>, session_id: SessionId, socket: Web
             };
             let _ = viewer_tx.try_send(joined);
 
+            // Replay the event log so the viewer can catch up to `latest_event_no`.
+            // A fresh viewer starts at next_event_no=0 and stays in "Loading
+            // session..." until it has received every event up to the
+            // latest_event_no we just advertised. Scrollback alone is the
+            // share-time snapshot; the events are what happened since, so we
+            // must replay them here (not only on reconnect).
+            for event in s.events_after(None) {
+                let _ = viewer_tx.try_send(DownstreamMessage::OrderedTerminalEvent(event));
+            }
+
             // Notify the sharer + other viewers that the roster changed.
             let list = s.participants.clone();
             s.send_sharer(sharer::DownstreamMessage::ParticipantListUpdated(list.clone()));
@@ -151,6 +161,8 @@ async fn run_viewer_loop(
             }
         };
 
+        tracing::debug!(%session_id, %viewer_id, kind = upstream_kind(&msg), "viewer -> server");
+
         let mut s = session.lock().await;
         match msg {
             UpstreamMessage::Initialize(_) => {}
@@ -161,6 +173,10 @@ async fn run_viewer_loop(
             }
             // --- Control path: forward viewer request to the sharer ---
             UpstreamMessage::ExecuteCommand { buffer_id, command } => {
+                tracing::info!(
+                    %session_id, %viewer_id, sharer_connected = s.sharer_tx.is_some(),
+                    "forwarding ExecuteCommand to sharer: {command:?}"
+                );
                 s.send_sharer(sharer::DownstreamMessage::CommandExecutionRequested {
                     id: CommandExecutionRequestId::new(),
                     participant_id: viewer_id.clone(),
@@ -254,4 +270,32 @@ async fn run_viewer_loop(
     }
     let _ = state;
     tracing::info!(%session_id, %viewer_id, "viewer left");
+}
+
+/// Short label for a viewer upstream message, for debug logging.
+fn upstream_kind(msg: &UpstreamMessage) -> &'static str {
+    match msg {
+        UpstreamMessage::Initialize(_) => "Initialize",
+        UpstreamMessage::Ping { .. } => "Ping",
+        UpstreamMessage::UpdateSelection(_) => "UpdateSelection",
+        UpstreamMessage::RequestRole(_) => "RequestRole",
+        UpstreamMessage::CancelRoleRequest(_) => "CancelRoleRequest",
+        UpstreamMessage::UpdateInput(_) => "UpdateInput",
+        UpstreamMessage::ExecuteCommand { .. } => "ExecuteCommand",
+        UpstreamMessage::WriteToPty { .. } => "WriteToPty",
+        UpstreamMessage::SendAgentPrompt(_) => "SendAgentPrompt",
+        UpstreamMessage::UpdateUniversalDeveloperInputContext(_) => {
+            "UpdateUniversalDeveloperInputContext"
+        }
+        UpstreamMessage::SendControlAction(_) => "SendControlAction",
+        UpstreamMessage::Reauthenticated { .. } => "Reauthenticated",
+        UpstreamMessage::UpdateLinkAccessLevel { .. } => "UpdateLinkAccessLevel",
+        UpstreamMessage::UpdateTeamAccessLevel { .. } => "UpdateTeamAccessLevel",
+        UpstreamMessage::AddGuests { .. } => "AddGuests",
+        UpstreamMessage::RemoveGuest { .. } => "RemoveGuest",
+        UpstreamMessage::RemovePendingGuest { .. } => "RemovePendingGuest",
+        UpstreamMessage::UpdateUserRole { .. } => "UpdateUserRole",
+        UpstreamMessage::UpdatePendingUserRole { .. } => "UpdatePendingUserRole",
+        UpstreamMessage::ReportTerminalSize { .. } => "ReportTerminalSize",
+    }
 }

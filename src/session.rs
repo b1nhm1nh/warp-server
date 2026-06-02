@@ -16,7 +16,7 @@ use std::collections::{HashMap, VecDeque};
 
 use session_sharing_protocol::common::{
     ActivePrompt, BlockId, InputReplicaId, OrderedTerminalEvent, ParticipantId, ParticipantInfo,
-    ParticipantList, PresentViewer, ProfileData, Role, Scrollback, Sharer, WindowSize,
+    ParticipantList, PresentViewer, ProfileData, Role, Scrollback, Sharer, Viewer, WindowSize,
 };
 use session_sharing_protocol::sharer::{ReconnectToken, SessionSourceType};
 use session_sharing_protocol::{sharer, viewer};
@@ -159,20 +159,36 @@ impl Session {
     }
 
     /// Register a present viewer in the participant list with full access.
+    ///
+    /// We populate BOTH the modern `present_viewers` (with `max_acl`) AND the
+    /// legacy `viewers` vec (with `role`). The sharer client derives a viewer's
+    /// *effective* role — the one it checks before executing a remote command —
+    /// from `participants.viewers[].role` (see presence_manager). If we only
+    /// filled `present_viewers`, `viewer_role()` returns `None`, the sharer
+    /// rejects every command with "Failed to get viewer's role", and remote
+    /// control silently does nothing.
     pub fn add_present_viewer(&mut self, id: ParticipantId, input_replica_id: InputReplicaId) {
         let firebase_uid = format!("self-hosted-viewer-{id}");
-        self.participants.present_viewers.push(PresentViewer {
-            info: ParticipantInfo {
-                id,
-                profile_data: ProfileData {
-                    firebase_uid,
-                    display_name: "Viewer".to_owned(),
-                    input_replica_id,
-                    ..Default::default()
-                },
-                selection: Default::default(),
+        let info = ParticipantInfo {
+            id: id.clone(),
+            profile_data: ProfileData {
+                firebase_uid,
+                display_name: "Viewer".to_owned(),
+                input_replica_id,
+                ..Default::default()
             },
-            // No limits: everyone gets the highest role.
+            selection: Default::default(),
+        };
+
+        // Legacy field the sharer reads for the effective role. No limits, so Full.
+        self.participants.viewers.push(Viewer {
+            info: info.clone(),
+            role: Role::Full,
+            is_present: true,
+        });
+        // Modern field for ACL-aware clients. max_acl is the ceiling, also Full.
+        self.participants.present_viewers.push(PresentViewer {
+            info,
             max_acl: Role::Full,
         });
     }
@@ -182,6 +198,7 @@ impl Session {
         self.participants
             .present_viewers
             .retain(|v| &v.info.id != id);
+        self.participants.viewers.retain(|v| &v.info.id != id);
     }
 
     /// Events with `event_no` strictly greater than `after` (catch-up on join).

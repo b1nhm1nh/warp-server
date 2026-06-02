@@ -29,6 +29,52 @@ async fn join_viewer(server: &TestServer, id: &SessionId) -> (Ws, ViewerDown) {
 }
 
 #[tokio::test]
+async fn joined_viewer_appears_in_legacy_viewers_with_executable_role() {
+    // Regression: the sharer client derives a viewer's *effective* role (the one
+    // it checks before running a remote command) from the legacy
+    // `participants.viewers[].role`. If we only fill `present_viewers`, the
+    // sharer can't find the role and silently rejects every command. Assert the
+    // joined viewer shows up in the legacy `viewers` vec with a role that can
+    // execute, in the ParticipantListUpdated the sharer receives.
+    use session_sharing_protocol::common::Role;
+
+    let server = TestServer::start().await;
+    let (mut sharer, id) = open_session(&server, b"").await;
+    let (_viewer, joined) = join_viewer(&server, &id).await;
+    let viewer_id = match joined {
+        ViewerDown::JoinedSuccessfully { viewer_id, .. } => viewer_id,
+        _ => unreachable!(),
+    };
+
+    let list = recv_sharer(&mut sharer, |m| {
+        matches!(m, SharerDown::ParticipantListUpdated(_))
+    })
+    .await;
+    let SharerDown::ParticipantListUpdated(list) = list else {
+        unreachable!()
+    };
+
+    let legacy = list
+        .viewers
+        .iter()
+        .find(|v| v.info.id == viewer_id)
+        .expect("viewer must appear in legacy `viewers` vec");
+    assert!(
+        legacy.role.can_execute(),
+        "viewer's legacy role must allow command execution (got {:?})",
+        legacy.role
+    );
+    assert!(legacy.is_present, "viewer must be marked present");
+    // And the modern field should grant Full as the ceiling.
+    let present = list
+        .present_viewers
+        .iter()
+        .find(|v| v.info.id == viewer_id)
+        .expect("viewer must appear in present_viewers");
+    assert_eq!(present.max_acl, Role::Full);
+}
+
+#[tokio::test]
 async fn create_join_and_scrollback() {
     let server = TestServer::start().await;
     let (_sharer, id) = open_session(&server, b"history-bytes").await;
@@ -76,7 +122,7 @@ async fn live_fanout_to_two_viewers_and_ack() {
 }
 
 #[tokio::test]
-async fn fresh_join_reports_latest_event_no_and_reconnect_catches_up() {
+async fn fresh_join_replays_event_log_then_reconnect_catches_up() {
     let server = TestServer::start().await;
     let (mut sharer, id) = open_session(&server, b"").await;
 
@@ -90,8 +136,10 @@ async fn fresh_join_reports_latest_event_no_and_reconnect_catches_up() {
     })
     .await;
 
-    // Fresh viewer: no event replay, but latest_event_no must be Some(2).
-    let (viewer, joined) = join_viewer(&server, &id).await;
+    // Fresh viewer: must report latest_event_no=Some(2) AND replay events 0,1,2
+    // so the client can catch up (otherwise it hangs on "Loading session...").
+    // This is the regression guard for that bug.
+    let (mut viewer, joined) = join_viewer(&server, &id).await;
     let (viewer_id, latest) = match joined {
         ViewerDown::JoinedSuccessfully {
             viewer_id,
@@ -101,6 +149,15 @@ async fn fresh_join_reports_latest_event_no_and_reconnect_catches_up() {
         _ => unreachable!(),
     };
     assert_eq!(latest, Some(2));
+
+    // The fresh viewer must receive events 0, 1, 2 in order.
+    for expected in 0..3 {
+        let ev = recv_viewer(&mut viewer, |m| matches!(m, ViewerDown::OrderedTerminalEvent(_))).await;
+        let ViewerDown::OrderedTerminalEvent(e) = ev else {
+            unreachable!()
+        };
+        assert_eq!(e.event_no, expected, "fresh viewer must replay event {expected}");
+    }
 
     // Disconnect, then reconnect with last_received_event_no = Some(0): expect
     // catch-up of events 1 and 2, then RejoinedSuccessfully.
